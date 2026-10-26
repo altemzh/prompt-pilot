@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{margin:0}[hidden]{display:none!important}</style>
+<title>Prompt Pilot</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: one centred "AI console" — game screen on top, prompt line and stats below. Single committed night-lab look. */
+:root {
+  --bg: #0B1026;
+  --panel: #141A3D;
+  --line: #2A3270;
+  --ink: #EEF1FF;
+  --muted: #98A2D8;
+  --cyan: #5EE7FF;
+  --amber: #FFB547;
+  --pink: #FF6FAE;
+  --display: "Chakra Petch", "Trebuchet MS", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--mono);
+  display: flex; justify-content: center; box-sizing: border-box;
+  padding-block: 16px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.cab { width: 100%; max-width: 480px; display: flex; flex-direction: column; gap: 12px; }
+header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+h1 { font-family: var(--display); font-weight: 700; font-size: 30px; margin: 0; letter-spacing: .04em; color: var(--cyan); }
+h1 span { color: var(--amber); }
+.tag { font-size: 12px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+canvas { width: 100%; max-width: 100%; aspect-ratio: 3 / 4; display: block; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); outline: none; }
+canvas:focus-visible { box-shadow: 0 0 0 3px var(--cyan); }
+.prompt { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; display: flex; align-items: center; gap: 12px; }
+.prompt small { color: var(--muted); font-size: 12px; letter-spacing: .08em; }
+.word { font-weight: 800; font-size: clamp(26px, 8vw, 38px); letter-spacing: .14em; flex: 1; text-align: center; min-height: 1.3em; }
+.word .done { color: var(--cyan); }
+.word .next { color: var(--amber); text-decoration: underline; text-underline-offset: 6px; }
+.word .rest { color: var(--muted); }
+.word.shake { animation: shake .25s; }
+@keyframes shake { 25%{transform:translateX(-6px)} 75%{transform:translateX(6px)} }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px; text-align: center; }
+.stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; color: var(--ink); }
+.stat span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+.controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 13px; color: var(--muted); }
+.controls button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
+.controls button[aria-pressed="true"] { background: var(--cyan); color: var(--bg); border-color: var(--cyan); font-weight: 800; }
+.controls button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .word.shake { animation: none; } }
+</style>
+
+<div class="cab">
+  <header>
+    <h1>PROMPT<span>PILOT</span></h1>
+    <span class="tag">Every letter is a token of fuel</span>
+  </header>
+  <canvas id="game" width="480" height="640" tabindex="0" aria-label="Prompt Pilot game. Type the highlighted letter to make the robot fly."></canvas>
+  <div class="prompt"><small>&gt;_</small><div class="word" id="word" aria-live="polite"></div></div>
+  <div class="stats">
+    <div class="stat"><b id="sScore">0</b><span>Servers</span></div>
+    <div class="stat"><b id="sWpm">0</b><span>WPM</span></div>
+    <div class="stat"><b id="sAcc">100%</b><span>Accuracy</span></div>
+    <div class="stat"><b id="sBest">0</b><span>Best</span></div>
+  </div>
+  <div class="controls">
+    Word pack:
+    <button id="pAI" aria-pressed="true">AI Basics</button>
+    <button id="pCode" aria-pressed="false">Vibe Coding</button>
+  </div>
+</div>
+
+<script>
+// ===== Settings: tuned EASY after playtesting (first version was too hard) =====
+const W = 480, H = 640, GROUND = 50;
+const GRAVITY = 0.16;       // was 0.32 -> bot falls half as fast
+const FLAP = -4.2;          // smaller hop, so one letter never throws you into a pipe
+const MAX_FALL = 4.5;       // NEW: falling speed is capped, so a pause is not instant death
+const GAP = 230;            // was 180 -> bigger opening
+const PIPE_EVERY = 2300;    // was 1700 ms -> more time between servers
+const BASE_SPEED = 1.6;     // was 2.2
+const HIT = 12;             // forgiving hitbox (smaller than the drawing)
+
+// ===== Word packs: short AI words, easy to type =====
+const PACKS = {
+  ai:   ["ai","data","model","token","prompt","agent","chat","train","robot","learn","neural","claude","input","output","vision"],
+  code: ["code","debug","test","bug","fix","html","loop","ship","vibe","run","app","css","file","save","undo"]
+};
+let pack = "ai";
+
+const cv = document.getElementById("game"), ctx = cv.getContext("2d");
+const wordEl = document.getElementById("word");
+const $ = id => document.getElementById(id);
+
+let state, bot, servers, score, word, idx, typed, misses, startTime, lastServer, best = 0, sparks = [];
+try { best = +localStorage.getItem("pp-best") || 0; } catch (e) {}
+
+function newWord() {
+  const list = PACKS[pack];
+  let w; do { w = list[Math.floor(Math.random() * list.length)]; } while (w === word);
+  word = w; idx = 0; drawWord();
+}
+
+function reset() {
+  state = "ready";               // ready -> playing -> over
+  bot = { x: 140, y: H / 2 - 20, vy: 0 };
+  servers = []; sparks = []; score = 0; typed = 0; misses = 0; lastServer = 0; startTime = 0;
+  newWord(); updateStats();
+}
+
+function drawWord(miss) {
+  wordEl.innerHTML =
+    `<span class="done">${word.slice(0, idx)}</span>` +
+    `<span class="next">${word[idx] || ""}</span>` +
+    `<span class="rest">${word.slice(idx + 1)}</span>`;
+  if (miss) { wordEl.classList.remove("shake"); void wordEl.offsetWidth; wordEl.classList.add("shake"); }
+}
+
+function updateStats() {
+  const mins = startTime ? (performance.now() - startTime) / 60000 : 0;
+  const wpm = mins > 0.05 ? Math.round((typed / 5) / mins) : 0;   // standard WPM: 5 letters = 1 word
+  const acc = typed + misses ? Math.round(100 * typed / (typed + misses)) : 100;
+  $("sScore").textContent = score; $("sWpm").textContent = wpm;
+  $("sAcc").textContent = acc + "%"; $("sBest").textContent = best;
+}
+
+// ===== Input: the core idea — typing is the jump button =====
+document.addEventListener("keydown", e => {
+  if (e.repeat) return;   // BUG FIX: holding a key auto-repeated flaps forever
+  const k = e.key.toLowerCase();
+  if (state === "over") { if (k === " " || k === "enter") { e.preventDefault(); reset(); } return; }
+  if (k.length !== 1 || !/[a-z]/.test(k)) return;
+  e.preventDefault();
+  if (k === word[idx]) {
+    if (state === "ready") { state = "playing"; startTime = performance.now(); lastServer = performance.now() - 800; }
+    bot.vy = FLAP; typed++; idx++;
+    sparks.push({ x: bot.x - 10, y: bot.y + 18, ch: k.toUpperCase(), life: 1 });
+    if (idx >= word.length) newWord(); else drawWord();
+  } else if (state === "playing") {
+    misses++; drawWord(true);   // wrong letter: no fuel, no flap
+  }
+});
+
+// ===== Game loop =====
+let prev = performance.now();
+function loop(now) {
+  const dt = Math.min(2, (now - prev) / 16.67); prev = now;
+  if (state === "playing") update(now, dt);
+  else if (state === "ready") bot.y = H / 2 - 20 + Math.sin(now / 300) * 8;   // hover while waiting
+  render(now);
+  requestAnimationFrame(loop);
+}
+
+function update(now, dt) {
+  const speed = Math.min(BASE_SPEED + score * 0.03, 2.6);   // speeds up slowly, with a ceiling
+  bot.vy = Math.min(bot.vy + GRAVITY * dt, MAX_FALL);
+  bot.y += bot.vy * dt;
+  if (now - lastServer > PIPE_EVERY) {
+    lastServer = now;
+    const top = 80 + Math.random() * (H - GAP - GROUND - 160);
+    servers.push({ x: W + 10, top, passed: false });
+  }
+  for (const s of servers) {
+    s.x -= speed * dt;
+    if (!s.passed && s.x + 64 < bot.x) { s.passed = true; score++; }
+    const hitX = bot.x + HIT > s.x && bot.x - HIT < s.x + 64;
+    const hitY = bot.y - HIT < s.top || bot.y + HIT > s.top + GAP;
+    if (hitX && hitY) return gameOver();
+  }
+  servers = servers.filter(s => s.x > -80);
+  if (bot.y > H - GROUND - 14) return gameOver();
+  if (bot.y < 16) { bot.y = 16; bot.vy = 0; }   // ceiling is safe, not a crash
+  updateStats();
+}
+
+function gameOver() {
+  state = "over";
+  if (score > best) { best = score; try { localStorage.setItem("pp-best", best); } catch (e) {} }
+  updateStats();
+}
+
+// ===== Drawing =====
+function render(now) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0B1026"); g.addColorStop(1, "#24164F");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // moving circuit grid
+  ctx.strokeStyle = "rgba(94,231,255,.07)"; ctx.lineWidth = 1;
+  const off = (now / 40) % 40;
+  for (let x = -off; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  // server racks (the "pipes")
+  for (const s of servers) { rack(s.x, 0, s.top, now); rack(s.x, s.top + GAP, H - GROUND - s.top - GAP, now); }
+
+  // floor
+  ctx.fillStyle = "#141A3D"; ctx.fillRect(0, H - GROUND, W, GROUND);
+  ctx.fillStyle = "#5EE7FF"; ctx.fillRect(0, H - GROUND, W, 3);
+
+  // token sparks left behind by each correct letter
+  ctx.font = "800 16px 'JetBrains Mono', monospace"; ctx.textAlign = "center";
+  for (const p of sparks) { p.x -= 2; p.y += 0.6; p.life -= 0.025; ctx.fillStyle = `rgba(255,181,71,${Math.max(0, p.life)})`; ctx.fillText(p.ch, p.x, p.y); }
+  sparks = sparks.filter(p => p.life > 0);
+
+  drawBot(now);
+
+  if (state !== "over" && word[idx]) {
+    ctx.font = "800 24px 'JetBrains Mono', monospace"; ctx.textAlign = "center";
+    ctx.fillStyle = "#FFB547"; ctx.fillText(word[idx].toUpperCase(), bot.x, bot.y - 34);
+  }
+
+  ctx.textAlign = "center"; ctx.fillStyle = "#EEF1FF";
+  ctx.font = "700 52px 'Chakra Petch', sans-serif"; ctx.fillText(score, W / 2, 78);
+
+  if (state === "ready") banner("TYPE TO FLY", `Type "${word[0].toUpperCase()}" to boot up`);
+  if (state === "over") banner("CONNECTION LOST", `${$("sWpm").textContent} WPM · ${$("sAcc").textContent} acc · Space to retry`);
+}
+
+function rack(x, y, h, now) {
+  if (h <= 0) return;
+  ctx.fillStyle = "#232A57"; ctx.fillRect(x, y, 64, h);
+  ctx.strokeStyle = "#3B4590"; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, 62, h - 2);
+  for (let yy = y + 14; yy < y + h - 8; yy += 22) {
+    ctx.fillStyle = "#1A2048"; ctx.fillRect(x + 8, yy - 6, 48, 14);
+    const on = Math.sin(now / 200 + yy) > 0;
+    ctx.fillStyle = on ? "#5EE7FF" : "#FF6FAE"; ctx.fillRect(x + 46, yy - 2, 5, 5);
+  }
+}
+
+function drawBot(now) {
+  const tilt = Math.max(-0.35, Math.min(0.6, bot.vy / 9));
+  ctx.save(); ctx.translate(bot.x, bot.y); ctx.rotate(tilt);
+  // glow
+  ctx.fillStyle = "rgba(94,231,255,.15)"; ctx.beginPath(); ctx.arc(0, 0, 28, 0, Math.PI * 2); ctx.fill();
+  // antenna
+  ctx.strokeStyle = "#98A2D8"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(0, -16); ctx.lineTo(0, -26); ctx.stroke();
+  ctx.fillStyle = Math.sin(now / 150) > 0 ? "#FF6FAE" : "#FFB547"; ctx.beginPath(); ctx.arc(0, -28, 4, 0, Math.PI * 2); ctx.fill();
+  // head
+  ctx.fillStyle = "#FFB547"; roundRect(-18, -16, 36, 30, 9); ctx.fill();
+  // visor + eyes
+  ctx.fillStyle = "#0B1026"; roundRect(-13, -9, 26, 14, 6); ctx.fill();
+  ctx.fillStyle = "#5EE7FF"; ctx.fillRect(-8, -5, 5, 6); ctx.fillRect(4, -5, 5, 6);
+  // jet flame
+  ctx.fillStyle = bot.vy < 0 ? "#5EE7FF" : "rgba(94,231,255,.35)";
+  ctx.beginPath(); ctx.moveTo(-8, 14); ctx.lineTo(0, 14 + (bot.vy < 0 ? 16 : 7)); ctx.lineTo(8, 14); ctx.fill();
+  ctx.restore();
+}
+function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+
+function banner(title, sub) {
+  ctx.fillStyle = "rgba(11,16,38,.85)"; ctx.fillRect(36, H / 2 - 84, W - 72, 150);
+  ctx.strokeStyle = "#5EE7FF"; ctx.lineWidth = 2; ctx.strokeRect(36, H / 2 - 84, W - 72, 150);
+  ctx.fillStyle = "#5EE7FF"; ctx.font = "700 36px 'Chakra Petch', sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(title, W / 2, H / 2 - 22);
+  ctx.fillStyle = "#EEF1FF"; ctx.font = "500 15px 'JetBrains Mono', monospace";
+  ctx.fillText(sub, W / 2, H / 2 + 24);
+}
+
+// ===== Word pack buttons =====
+function setPack(p) {
+  pack = p; word = null;
+  $("pAI").setAttribute("aria-pressed", p === "ai");
+  $("pCode").setAttribute("aria-pressed", p === "code");
+  reset(); cv.focus();
+}
+$("pAI").onclick = () => setPack("ai");
+$("pCode").onclick = () => setPack("code");
+cv.addEventListener("click", () => cv.focus());
+
+reset();
+requestAnimationFrame(loop);
+</script>
